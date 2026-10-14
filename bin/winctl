@@ -11,8 +11,7 @@
 # no scriptable equivalent.
 
 set -euo pipefail
-PROG=winctl
-# shellcheck source=../lib/common.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 load_config
 
@@ -169,20 +168,35 @@ cmd_key()   { need xdotool; DISPLAY="$WINCTL_DISPLAY" xdotool key -- "$@"; }
 cmd_click() { need xdotool; DISPLAY="$WINCTL_DISPLAY" xdotool mousemove "$1" "$2" click "${3:-1}"; }
 
 # --------------------------------------------------------------- ssh / files
-cmd_exec() { ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-                 "$(ssh_user)@$(host)" "$@"; }
-cmd_push() { scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$1" "$(ssh_user)@$(host):$2"
-             info "pushed $1 -> $2"; }
-cmd_pull() { scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$(ssh_user)@$(host):$1" "$2"
-             info "pulled $1 -> $2"; }
+# Each of these resolves the identity and the address up front, with an
+# explicit '|| return 1'. Inline "$(ssh_user)@$(host)" reads better but a
+# die() inside $(...) kills only the subshell, so a missing identity would be
+# silently spliced in as an empty string and ssh would be handed "@host".
+cmd_exec() {
+    local u h; u=$(ssh_user) || return 1; h=$(host) || return 1
+    ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+        "$u@$h" "$@"
+}
+cmd_push() {
+    local u h; u=$(ssh_user) || return 1; h=$(host) || return 1
+    scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$1" "$u@$h:$2"
+    info "pushed $1 -> $2"
+}
+cmd_pull() {
+    local u h; u=$(ssh_user) || return 1; h=$(host) || return 1
+    scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$u@$h:$1" "$2"
+    info "pulled $1 -> $2"
+}
 
 # Piping to `powershell -Command -` over SSH silently yields nothing when
 # DefaultShell is PowerShell, so stage the file and use -File.
 cmd_run() {
     [ -f "$1" ] || die "no such script: $1"
-    local remote="C:/Users/$(ssh_user)/.winctl-$(basename "$1")"
-    scp -i "$SSH_KEY" -o BatchMode=yes -q "$1" "$(ssh_user)@$(host):$remote"
-    ssh -i "$SSH_KEY" -o BatchMode=yes "$(ssh_user)@$(host)" \
+    local u h remote
+    u=$(ssh_user) || return 1; h=$(host) || return 1
+    remote="C:/Users/$u/.winctl-$(basename "$1")"
+    scp -i "$SSH_KEY" -o BatchMode=yes -q "$1" "$u@$h:$remote"
+    ssh -i "$SSH_KEY" -o BatchMode=yes "$u@$h" \
         "powershell -ExecutionPolicy Bypass -File ${remote//\//\\}"
 }
 
@@ -193,15 +207,16 @@ cmd_run() {
 # a remote path through two layers of quoting (ssh, then PowerShell) is a
 # reliable source of silent breakage.
 cmd_probe() {
-    local filter="${1:-*}"
-    local ts; ts=$(date +%Y%m%d-%H%M%S)
-    local out="C:/Users/$(ssh_user)/probe-$ts"
-    local remote="C:/Users/$(ssh_user)/.winctl-dump-devices.ps1"
+    local filter="${1:-*}" u h ts out remote
+    u=$(ssh_user) || return 1; h=$(host) || return 1
+    ts=$(date +%Y%m%d-%H%M%S)
+    out="C:/Users/$u/probe-$ts"
+    remote="C:/Users/$u/.winctl-dump-devices.ps1"
 
     info "probing with filter: $filter"
     scp -i "$SSH_KEY" -o BatchMode=yes -q "$HARNESS_ROOT/probes/dump-devices.ps1" \
-        "$(ssh_user)@$(host):$remote"
-    ssh -i "$SSH_KEY" -o BatchMode=yes "$(ssh_user)@$(host)" \
+        "$u@$h:$remote"
+    ssh -i "$SSH_KEY" -o BatchMode=yes "$u@$h" \
         "powershell -ExecutionPolicy Bypass -File ${remote//\//\\} \
          -Filter '$filter' -OutDir '${out//\//\\}'"
     cmd_pull "$out" "$CAPTURES/"

@@ -12,13 +12,15 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Check shell scripts
-        run: |
-          # -x follows the sourced library so variables set there resolve.
-          shellcheck -x --severity=warning \
-            bin/harness bin/winctl bin/usbcap bin/hostdev bin/hwdbg
+        # -x follows the sourced library; the scripts carry a
+        # 'source-path=SCRIPTDIR' directive so it resolves from any CWD.
+        # No --severity floor: these are clean at full strictness, so keep it.
+        run: shellcheck -x bin/harness bin/winctl bin/usbcap bin/hostdev bin/hwdbg
       - name: Check the sourced library
         # Sourced, never executed, so it needs an explicit shell directive.
-        run: shellcheck --shell=bash --severity=warning lib/common.sh
+        run: shellcheck --shell=bash lib/common.sh
+      - name: Check syntax
+        run: for f in bin/* lib/common.sh; do bash -n "$f"; done
 
   psscriptanalyzer:
     runs-on: ubuntu-latest
@@ -28,6 +30,17 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $r = Invoke-ScriptAnalyzer -Path probes -Recurse -Severity Error,Warning
-          if ($r) { $r | Format-Table -AutoSize; exit 1 }
-          Write-Host 'PSScriptAnalyzer: clean'
+          $r = Invoke-ScriptAnalyzer -Path probes -Recurse `
+                 -Settings ./PSScriptAnalyzerSettings.psd1
+          if ($r) {
+              $r | Format-Table -AutoSize
+              # Also to the run summary, so findings are readable without
+              # digging through the raw log.
+              '## PSScriptAnalyzer findings' |
+                Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+              $r | ForEach-Object {
+                  "- **$($_.RuleName)** ``$($_.ScriptName):$($_.Line)`` - $($_.Message)"
+              } | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+              exit 1
+          }
+          Write-Output 'PSScriptAnalyzer: clean'

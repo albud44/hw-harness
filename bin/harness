@@ -9,10 +9,8 @@
 # project directory is the state. One clone, many investigations.
 
 set -euo pipefail
-PROG=harness
-SELF_LIB="$(dirname "$(readlink -f "$0")")/../lib/common.sh"
-# shellcheck source=../lib/common.sh
-. "$SELF_LIB"
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 
 # -------------------------------------------------------------------- init
 cmd_init() {
@@ -58,9 +56,13 @@ bad()  { printf '  \033[31m-\033[0m %s\n' "$*"; FAILED=1; }
 note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 
 check_tool() {
-    if command -v "$1" >/dev/null 2>&1; then ok "$1"
-    elif [ -n "${3:-}" ]; then note "$1 missing - $2 ($3)"
-    else bad "$1 missing - $2"; fi
+    if command -v "$1" >/dev/null 2>&1; then
+        ok "$1"
+    elif [ -n "${3:-}" ]; then
+        note "$1 missing - $2 ($3)"
+    else
+        bad "$1 missing - $2"
+    fi
 }
 
 cmd_doctor() {
@@ -101,13 +103,19 @@ cmd_doctor() {
         if [ -n "$USB_VID$USB_PID" ]
         then ok "device: $USB_VID:$USB_PID"
         else note "USB_VID/USB_PID unset (fine for a non-USB device)"; fi
-        [ -f "$SSH_KEY" ] && ok "ssh key: $SSH_KEY" || note "no ssh key yet - run 'winctl auth'"
+        if [ -f "$SSH_KEY" ]
+        then ok "ssh key: $SSH_KEY"
+        else note "no ssh key yet - run 'winctl auth'"; fi
     else
         note "not inside a project directory - run 'harness init <dir>'"
     fi
 
-    [ "$FAILED" -eq 0 ] || { echo; die "some required tools are missing"; }
-    echo; info "all required checks passed"
+    if [ "$FAILED" -ne 0 ]; then
+        echo
+        die "some required tools are missing"
+    fi
+    echo
+    info "all required checks passed"
 }
 
 # --------------------------------------------------------------------- iso

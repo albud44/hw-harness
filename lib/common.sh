@@ -18,9 +18,12 @@
 HARNESS_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 export HARNESS_ROOT
 
-die()  { echo "${PROG:-harness}: $*" >&2; exit 1; }
-info() { echo "[${PROG:-harness}] $*" >&2; }
-warn() { echo "[${PROG:-harness}] WARNING: $*" >&2; }
+# Derived from the sourcing script's own name, so no tool has to declare it.
+PROG=$(basename "$0")
+
+die()  { echo "$PROG: $*" >&2; exit 1; }
+info() { echo "[$PROG] $*" >&2; }
+warn() { echo "[$PROG] WARNING: $*" >&2; }
 
 need() {
     local t missing=()

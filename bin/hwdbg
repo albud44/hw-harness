@@ -140,6 +140,8 @@ cmd_debugfs() {
     done
     if [ "$found" -eq 0 ]; then
         echo "none of DEBUGFS_DIRS exist; top-level debugfs entries:"
+        # Human-readable listing, never parsed - ls is the right tool.
+        # shellcheck disable=SC2012
         ls /sys/kernel/debug 2>/dev/null | head -40 || echo "(none)"
     fi
 }
@@ -271,6 +273,8 @@ cmd_acpi() {
         chmod 644 "$ACPI_OUT/$(basename "$t")"
     done
     echo "=== copied to $ACPI_OUT ==="
+    # Human-readable listing, never parsed; tail -n +2 drops the "total" line.
+    # shellcheck disable=SC2012
     ls -l "$ACPI_OUT" | tail -n +2
     echo
     echo "decompile with: iasl -d $ACPI_OUT/*"

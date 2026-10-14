@@ -33,16 +33,13 @@ deliberately does not touch vendor `.sys` code.
 
 ## Requirements
 
-A Linux host with libvirt/KVM, and a **Windows 11 Pro** guest (Home has no RDP
-server). On Fedora:
+Developed and tested on Fedora. You need libvirt/KVM and a **Windows 11 Pro**
+guest (Home has no RDP server):
 
     sudo dnf install libvirt virt-manager freerdp xorg-x11-server-Xvfb \
                      xdotool libsecret wireshark-cli usbutils ImageMagick \
                      acpica-tools xorriso
     sudo usermod -aG libvirt,wireshark $USER    # then log out and back in
-
-Debian/Ubuntu: `libvirt-daemon-system virt-manager freerdp2-x11 xvfb xdotool
-libsecret-tools tshark usbutils imagemagick acpica-tools xorriso`.
 
 `harness doctor` checks all of it and tells you what is missing and why it
 matters.

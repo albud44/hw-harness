@@ -10,13 +10,13 @@
 # and reattach it on detach, so no manual unbind is needed.
 
 set -euo pipefail
-PROG=hostdev
-# shellcheck source=../lib/common.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
 . "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
 load_config
 
-[ -n "$USB_VID" ] && [ -n "$USB_PID" ] \
-    || die "USB_VID / USB_PID are not set in $PROJECT/harness.conf"
+if [ -z "$USB_VID" ] || [ -z "$USB_PID" ]; then
+    die "USB_VID / USB_PID are not set in $PROJECT/harness.conf"
+fi
 need virsh
 
 xml="$RUN/hostdev.xml"
