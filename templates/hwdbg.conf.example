@@ -1,0 +1,50 @@
+# hwdbg.conf - what the root helper is allowed to touch, for ONE device.
+#
+# Install root-owned, world-readable, not group/world writable - hwdbg refuses
+# to run otherwise, because these values feed modprobe and i2c:
+#
+#   sudo install -m 0644 -o root -g root hwdbg.conf /usr/local/etc/hwdbg.conf
+#
+# Keep the editable copy in your project directory and reinstall after changes.
+# Values below are the ThinkPad X1 Carbon Gen 14 IPU7 + IMX471 camera, as a
+# worked example; see examples/ for the version that shipped with it.
+
+# Modules to toggle pr_debug on with 'hwdbg dyndbg on'.
+DBG_MODS="intel_ipu7 intel_ipu7_isys imx471 ipu_bridge"
+
+# 'hwdbg reload' order. These are NOT reverses of each other: a consumer must
+# go down before the core it references, and some modules only come up as
+# dependencies of others.
+RELOAD_DOWN="intel_ipu7_isys imx471 intel_ipu7 ipu_bridge"
+RELOAD_UP="intel_ipu7 imx471 intel_ipu7_isys"
+
+# Extended regex used to filter lsmod and dmesg output for this device.
+LOG_GREP='ipu7|imx471|int3472'
+
+# i2c: first bus is the device's own, the rest are also scanned by 'i2cscan'.
+I2C_BUSES="0 1"
+I2C_ADDR=0x1a
+I2C_REG_WIDTH=16        # 8 or 16 - IMX471 uses 16-bit register addresses
+
+# Candidate debugfs directories; non-existent ones are skipped.
+DEBUGFS_DIRS="/sys/kernel/debug/intel_ipu7 /sys/kernel/debug/ipu7
+              /sys/kernel/debug/intel-ipu7 /sys/kernel/debug/ipu7_isys"
+
+# Media controller device for 'hwdbg topology'.
+MEDIA_DEV=/dev/media0
+
+# PCI device for 'hwdbg pm'.
+PCI_DEV=0000:00:05.0
+
+# Where 'hwdbg acpi' drops copied firmware tables. Absolute path; the files
+# are chowned to the invoking user.
+ACPI_OUT=/home/YOURNAME/projects/YOURDEVICE/captures/acpi
+
+# Globs under /sys/bus/acpi/devices to list alongside. On Intel laptop
+# cameras, INT3472 is the power/clock/GPIO companion and the vendor ID (here
+# TBE*) is the sensor itself.
+ACPI_DEVICES="TBE* INT3472*"
+
+# Fallback for chowning output when hwdbg is run as root directly rather than
+# through sudo (SUDO_UID unset). Your numeric uid.
+OWNER_UID=1000

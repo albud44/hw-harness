@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# harness - set up and check a project directory.
+#
+#   harness init <dir>   scaffold a new investigation
+#   harness doctor       check this machine has what the tools need
+#   harness iso          build the first-contact ISO for the Windows guest
+#
+# 'init' deliberately does not touch the clone: the clone is the tool, the
+# project directory is the state. One clone, many investigations.
+
+set -euo pipefail
+PROG=harness
+SELF_LIB="$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+# shellcheck source=../lib/common.sh
+. "$SELF_LIB"
+
+# -------------------------------------------------------------------- init
+cmd_init() {
+    local dir="${1:-.}"
+    mkdir -p "$dir"
+    dir=$(cd "$dir" && pwd)
+
+    if [ -f "$dir/harness.conf" ]; then
+        info "$dir/harness.conf already exists, leaving it alone"
+    else
+        cp "$HARNESS_ROOT/templates/harness.conf.example" "$dir/harness.conf"
+        info "wrote $dir/harness.conf - edit it before anything else"
+    fi
+    mkdir -p "$dir/etc" "$dir/.run" "$dir/captures"
+    chmod 700 "$dir/etc" "$dir/.run"
+
+    # A project directory is usually inside a git repo holding the actual
+    # driver work, so make sure its state cannot be committed by accident.
+    if [ ! -f "$dir/.gitignore" ]; then
+        cat > "$dir/.gitignore" <<'EOF'
+# hw-harness project state: SSH private key, identities, pidfiles, raw traces.
+etc/
+.run/
+captures/
+EOF
+        info "wrote $dir/.gitignore (etc/ holds a private key - keep it out of git)"
+    fi
+
+    cat <<EOF
+
+Next:
+  1. edit $dir/harness.conf   (VM_NAME, USB_VID/USB_PID)
+  2. cd $dir && winctl auth   (generates the SSH key, stores RDP credentials)
+  3. harness iso              (build the bootstrap ISO)
+  4. attach the ISO to the VM, run win-bootstrap.ps1 elevated in the guest
+  5. winctl status            (should report 'ssh: ok')
+EOF
+}
+
+# ------------------------------------------------------------------ doctor
+ok()   { printf '  \033[32m+\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31m-\033[0m %s\n' "$*"; FAILED=1; }
+note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+
+check_tool() {
+    if command -v "$1" >/dev/null 2>&1; then ok "$1"
+    elif [ -n "${3:-}" ]; then note "$1 missing - $2 ($3)"
+    else bad "$1 missing - $2"; fi
+}
+
+cmd_doctor() {
+    FAILED=0
+    echo "host tools (required):"
+    check_tool virsh        "libvirt client, for VM and passthrough control"
+    check_tool ssh          "scripted work in the guest"
+    check_tool Xvfb         "the private off-screen display"
+    check_tool xdotool      "synthetic input into that display"
+    check_tool secret-tool  "RDP password storage (libsecret)"
+    check_tool tshark       "usbmon capture and analysis (wireshark-cli)"
+    check_tool lsusb        "locating the device (usbutils)"
+    if command -v xfreerdp3 >/dev/null || command -v xfreerdp >/dev/null
+    then ok "xfreerdp"; else bad "xfreerdp missing - the RDP client (freerdp)"; fi
+
+    echo "host tools (optional):"
+    check_tool import  "screenshots of the off-screen session" "ImageMagick"
+    check_tool ffmpeg  "screenshot fallback"                   "optional"
+    check_tool iasl    "decompiling ACPI tables pulled from the guest" "acpica-tools"
+    check_tool xorrisofs "building the bootstrap ISO" "or genisoimage/mkisofs"
+    check_tool innoextract "unpacking vendor installers without running them" "optional"
+
+    echo "permissions:"
+    if id -nG | tr ' ' '\n' | grep -qx wireshark
+    then ok "member of group 'wireshark' (dumpcap usable)"
+    else note "not in group 'wireshark': usbcap needs sudo (that is fine)"; fi
+    if virsh -c "${VM_LIBVIRT_URI:-qemu:///system}" list >/dev/null 2>&1
+    then ok "libvirt system connection reachable"
+    else bad "cannot reach ${VM_LIBVIRT_URI:-qemu:///system} - add yourself to 'libvirt'"; fi
+    if modinfo usbmon >/dev/null 2>&1 || [ -e /dev/usbmon0 ]
+    then ok "usbmon available"
+    else note "usbmon not found: 'modprobe usbmon' needs root, or it is built in"; fi
+
+    echo "project:"
+    if PROJECT=$(find_project 2>/dev/null); then
+        ok "project: $PROJECT"
+        load_config
+        if [ -n "$USB_VID$USB_PID" ]
+        then ok "device: $USB_VID:$USB_PID"
+        else note "USB_VID/USB_PID unset (fine for a non-USB device)"; fi
+        [ -f "$SSH_KEY" ] && ok "ssh key: $SSH_KEY" || note "no ssh key yet - run 'winctl auth'"
+    else
+        note "not inside a project directory - run 'harness init <dir>'"
+    fi
+
+    [ "$FAILED" -eq 0 ] || { echo; die "some required tools are missing"; }
+    echo; info "all required checks passed"
+}
+
+# --------------------------------------------------------------------- iso
+# The guest has no SSH and no shared folder before bootstrap, so the scripts
+# have to arrive on virtual media. The ISO carries the PROJECT's public key,
+# generated locally by 'winctl auth' - no key material ships in this repo.
+cmd_iso() {
+    load_config
+    local pub="$SSH_KEY.pub"
+    [ -f "$pub" ] || die "no public key at $pub; run 'winctl auth' first"
+
+    local mk
+    mk=$(command -v xorrisofs || command -v genisoimage || command -v mkisofs) \
+        || die "need xorrisofs, genisoimage or mkisofs"
+
+    local stage; stage=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand $stage now, not at trap time
+    trap "rm -rf '$stage'" EXIT
+
+    cp "$HARNESS_ROOT/probes/win-bootstrap.ps1" \
+       "$HARNESS_ROOT/probes/dump-devices.ps1" "$stage/"
+    cp "$pub" "$stage/harness.pub"
+
+    cat > "$stage/README.TXT" <<'EOF'
+hw-harness bootstrap disc.
+
+In an ELEVATED PowerShell, substituting this disc's real drive letter:
+
+    powershell -ExecutionPolicy Bypass -File D:\win-bootstrap.ps1
+
+It installs OpenSSH Server (key auth, using harness.pub from this disc),
+enables RDP, and installs the QEMU guest agent if the virtio-win CD is also
+mounted. Then, from Linux:
+
+    winctl status      -> should report 'ssh: ok'
+    winctl probe       -> runs dump-devices.ps1 and pulls the results back
+
+dump-devices.ps1 can also be run by hand from this disc if SSH is unavailable.
+EOF
+
+    local iso="$PROJECT/bootstrap.iso"
+    "$mk" -quiet -V HW_HARNESS -J -r -o "$iso" "$stage"
+    info "built $iso"
+    cat <<EOF
+
+Attach it to the VM:
+  virsh -c $VM_LIBVIRT_URI attach-disk $VM_NAME "$iso" sdc --type cdrom --mode readonly --live
+Or in virt-manager: Add Hardware -> Storage -> CDROM -> $iso
+EOF
+}
+
+usage() { cat >&2 <<'EOF'
+harness <command>
+
+  init [dir]    scaffold a project directory (default: .)
+  doctor        check host tools, permissions and the current project
+  iso           build the first-contact ISO for the Windows guest
+
+Per-project tools, run from inside a project directory:
+  winctl        Windows VM control (SSH, off-screen RDP, probes)
+  usbcap        time-boxed usbmon capture of the device
+  hostdev       move the device between host and guest
+  hwdbg         scoped root helper for Linux-side debugging (installed separately)
+EOF
+exit 1; }
+
+[ $# -ge 1 ] || usage
+c="$1"; shift
+case "$c" in
+  init|doctor|iso) "cmd_$c" "$@" ;;
+  *) usage ;;
+esac

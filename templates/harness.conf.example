@@ -1,0 +1,38 @@
+# harness.conf - one investigation, one device.
+#
+# Copied here by 'harness init'. This file marks the project root: the tools
+# find it by walking up from the current directory, so they work from anywhere
+# inside the tree. It is sourced as shell, so it can compute values if needed.
+
+# ------------------------------------------------------------ Windows guest
+# The libvirt domain holding the vendor driver. See doc/vm-setup.md.
+VM_NAME=win11
+VM_LIBVIRT_URI=qemu:///system
+
+# Leave VM_HOST empty to resolve the address through the QEMU guest agent on
+# every call (with the DHCP lease as fallback). Pin it only if the guest has a
+# static address or no agent, because a pinned address that goes stale fails
+# in confusing ways.
+VM_HOST=
+
+# ------------------------------------------------------- device under study
+# USB vendor:product, lower-case hex, no '0x'. From `lsusb`.
+# Drives usbcap (which usbmon bus to watch) and hostdev (passthrough).
+# Leave empty for a non-USB device - a PCI/MIPI camera, say - and use hwdbg
+# plus winctl probe instead.
+USB_VID=
+USB_PID=
+
+# -------------------------------------------------------- off-screen session
+# The private X display RDP renders into. It must not be a display you are
+# using: synthetic input goes to whatever display is named here.
+WINCTL_DISPLAY=:99
+WINCTL_GEOMETRY=1920x1080
+
+# Default RDP domain offered by 'winctl auth'. For a Microsoft account the
+# domain is MicrosoftAccount and the username is the full email address; for a
+# local account, use the machine name or leave the domain empty.
+RDP_DOMAIN_DEFAULT=MicrosoftAccount
+
+# Override where the SSH keypair lives. Default: <project>/etc/id_vm
+#SSH_KEY=

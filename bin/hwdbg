@@ -1,0 +1,322 @@
+#!/usr/bin/bash
+# hwdbg - fixed-function root helper for Linux-side hardware debugging.
+#
+# Installed root-owned 0755 at /usr/local/sbin/hwdbg and invoked through a
+# NOPASSWD sudoers rule for that one path. It takes NO free-form command, path
+# or module name: every privileged action is spelled out below, and the
+# device-specific details (module names, i2c addresses, debugfs paths) come
+# from a ROOT-OWNED config, not from the caller.
+#
+# That last point is the whole security argument. If the config were readable
+# from the user's project directory, "takes no free-form command" would be a
+# fiction - the caller would be supplying the module names to modprobe. So:
+# the config path is fixed, it is not overridable from the environment, and it
+# is refused unless root owns it and no one else can write it. If you can edit
+# either file, the scoping is meaningless.
+#
+# Notably absent: insmod of an arbitrary .ko. That is root-equivalent and is
+# not part of the diagnosis phase; it needs its own conversation.
+#
+#   sudo hwdbg <command>
+#
+# See doc/privilege-model.md and templates/hwdbg.conf.example.
+
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+# Fixed. Deliberately NOT settable from the environment.
+CONF=/usr/local/etc/hwdbg.conf
+
+die()  { echo "hwdbg: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------ config load
+[ -f "$CONF" ] || die "$CONF missing (see templates/hwdbg.conf.example)"
+
+# Refuse a config anyone but root can rewrite: it feeds modprobe and i2c.
+read -r owner perms < <(stat -c '%u %a' "$CONF")
+[ "$owner" = 0 ]          || die "$CONF must be owned by root (uid 0), not uid $owner"
+[ "$(( 8#$perms & 8#022 ))" -eq 0 ] \
+                          || die "$CONF is group/world writable ($perms); chmod 644"
+
+DBG_MODS=
+RELOAD_DOWN=
+RELOAD_UP=
+LOG_GREP=
+I2C_BUSES=
+I2C_ADDR=
+I2C_REG_WIDTH=16
+DEBUGFS_DIRS=
+MEDIA_DEV=
+PCI_DEV=
+ACPI_OUT=
+ACPI_DEVICES=
+OWNER_UID=
+# shellcheck source=/dev/null
+. "$CONF"
+
+# Everything the config supplies is validated before it reaches a privileged
+# command, because "root-owned" protects against the caller, not against typos.
+valid_mods() {
+    local m
+    # Unquoted on purpose throughout: the config holds space-separated lists,
+    # and splitting them is the point. Every element is validated here first.
+    # shellcheck disable=SC2086
+    for m in $1; do
+        [[ "$m" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid module name in config: '$m'"
+    done
+}
+valid_mods "$DBG_MODS"; valid_mods "$RELOAD_DOWN"; valid_mods "$RELOAD_UP"
+
+DDC=/sys/kernel/debug/dynamic_debug/control
+# chown results back to the invoking user, not root.
+UID_OUT=${SUDO_UID:-${OWNER_UID:-0}}
+GID_OUT=${SUDO_GID:-$UID_OUT}
+
+# ------------------------------------------------------------------ klog
+# dmesg is often blocked by kernel.dmesg_restrict=1 for non-root; this is the
+# single most common reason to need root at all.
+cmd_klog() {
+    local n="${1:-200}"
+    [[ "$n" =~ ^[0-9]{1,6}$ ]] || die "usage: klog [lines]"
+    dmesg --color=never -T | tail -n "$n"
+}
+
+# ---------------------------------------------------------------- dyndbg
+cmd_dyndbg() {
+    local flag
+    case "${1-}" in
+        on)  flag='+p' ;;
+        off) flag='-p' ;;
+        *)   die "usage: dyndbg on|off" ;;
+    esac
+    [ -n "$DBG_MODS" ] || die "DBG_MODS is empty in $CONF"
+    [ -e "$DDC" ] || die "dynamic_debug/control missing (debugfs not mounted?)"
+    local m
+    for m in $DBG_MODS; do
+        # A module with no pr_debug sites is not an error, just a no-op.
+        printf 'module %s %s\n' "$m" "$flag" > "$DDC" 2>/dev/null \
+            || echo "hwdbg: no debug sites in $m" >&2
+    done
+    echo "dyndbg $1: $DBG_MODS"
+    grep -cE "^($(echo "$DBG_MODS" | tr ' ' '|'))\b.*=p" "$DDC" 2>/dev/null \
+        | sed 's/^/enabled sites: /' || true
+}
+
+# ---------------------------------------------------------------- reload
+# Teardown and bring-up order are separate config values because they are not
+# simply reverses of each other: a consumer module must go down before the
+# core it references, and some modules are only loaded as dependencies.
+cmd_reload() {
+    [ -n "$RELOAD_DOWN$RELOAD_UP" ] || die "RELOAD_DOWN/RELOAD_UP are empty in $CONF"
+    local pat="${LOG_GREP:-.}"
+    echo "--- before ---"; lsmod | grep -E "$pat" || true
+    local m
+    for m in $RELOAD_DOWN; do modprobe -r "$m" 2>/dev/null || true; done
+    sleep 1
+    for m in $RELOAD_UP; do modprobe "$m" || die "modprobe $m failed (see klog)"; done
+    sleep 2
+    echo "--- after ---";  lsmod | grep -E "$pat" || true
+    echo "--- probe log ---"
+    dmesg --color=never -T | grep -iE "$pat" | tail -n 40 || true
+}
+
+# --------------------------------------------------------------- debugfs
+cmd_debugfs() {
+    [ -n "$DEBUGFS_DIRS" ] || die "DEBUGFS_DIRS is empty in $CONF"
+    local d found=0
+    for d in $DEBUGFS_DIRS; do
+        [ -d "$d" ] || continue
+        found=1
+        echo "=== $d ==="
+        find "$d" -maxdepth 4 -type f -print0 2>/dev/null \
+          | while IFS= read -r -d '' f; do
+                printf -- '--- %s ---\n' "${f#/sys/kernel/debug/}"
+                # Some debugfs files block forever or are enormous; cap both.
+                timeout 2 head -c 4096 "$f" 2>/dev/null || echo "(unreadable)"
+                echo
+            done
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "none of DEBUGFS_DIRS exist; top-level debugfs entries:"
+        ls /sys/kernel/debug 2>/dev/null | head -40 || echo "(none)"
+    fi
+}
+
+# ---------------------------------------------------------------- i2creg
+# The sensor driver is normally bound, so this needs i2ctransfer -f. That can
+# race the driver mid-transaction, so refuse while a consumer module is loaded
+# unless explicitly told 'force'.
+cmd_i2creg() {
+    local reg="${1-}" n="${2:-1}" force="${3-}"
+    [ -n "$I2C_ADDR" ] || die "I2C_ADDR is not set in $CONF"
+    # The first configured bus is the device's own; later ones are for scanning.
+    local bus=${I2C_BUSES%% *}
+    [[ "$bus" =~ ^[0-9]{1,2}$ ]] || die "I2C_BUSES is not set (or not numeric) in $CONF"
+    [[ "$reg" =~ ^0x[0-9a-fA-F]{1,4}$ ]] || die "usage: i2creg 0xNNNN [count] [force]"
+    [[ "$n"   =~ ^[0-9]{1,3}$ ]]         || die "count must be 1..999"
+    have i2ctransfer || die "i2ctransfer missing: install i2c-tools"
+
+    local blocker=${RELOAD_DOWN%% *}
+    if [ -n "$blocker" ] && lsmod | grep -q "^$blocker " && [ "$force" != force ]; then
+        die "$blocker is loaded and owns the device; pass 'force' to override, or unload first"
+    fi
+    modprobe i2c-dev 2>/dev/null || true
+    printf 'bus %s addr %s reg %s (%d byte(s)): ' "$bus" "$I2C_ADDR" "$reg" "$n"
+    if [ "$I2C_REG_WIDTH" = 16 ]; then
+        i2ctransfer -f -y "$bus" "w2@$I2C_ADDR" \
+            "$(( (reg >> 8) & 0xff ))" "$(( reg & 0xff ))" "r$n"
+    else
+        i2ctransfer -f -y "$bus" "w1@$I2C_ADDR" "$(( reg & 0xff ))" "r$n"
+    fi
+}
+
+# -------------------------------------------------------------- i2cscan
+# Locate the device and any module EEPROM. No -f here on purpose: forcing a
+# scan across a live sensor can corrupt an in-flight transaction. Addresses
+# already claimed by a bound driver show up as "UU", which is informative
+# rather than an error.
+cmd_i2cscan() {
+    have i2cdetect || die "i2cdetect missing: install i2c-tools"
+    modprobe i2c-dev 2>/dev/null || true
+    local b
+    for b in ${I2C_BUSES:-0 1}; do
+        [ -e "/dev/i2c-$b" ] || continue
+        echo "=== i2c-$b ($(cat "/sys/bus/i2c/devices/i2c-$b/name" 2>/dev/null)) ==="
+        i2cdetect -y -r "$b" 2>&1 || echo "(scan failed)"
+        echo
+    done
+    echo "=== instantiated i2c clients ==="
+    local d
+    for d in /sys/bus/i2c/devices/*-*; do
+        [ -r "$d/name" ] || continue
+        printf '  %-14s %s\n' "${d##*/}" "$(cat "$d/name" 2>/dev/null)"
+    done
+}
+
+# ---------------------------------------------------------------- eeprom
+# Per-unit calibration (lens shading, AF ranges, colour) frequently lives in
+# an EEPROM on the module rather than in any driver file - which is why a
+# vendor blob alone is not enough to reproduce the vendor's image quality.
+#
+# Read in 32-byte chunks: a single i2ctransfer read caps well below a full
+# dump. No -f: if something has the address claimed, failing is right.
+cmd_eeprom() {
+    local bus="${1-}" addr="${2-}" off="${3:-0}" len="${4:-256}" aw="${5:-16}"
+    [[ "$bus"  =~ ^[0-9]{1,2}$ ]]        || die "usage: eeprom <bus> <0xNN> [offset] [len] [8|16]"
+    [[ "$addr" =~ ^0x[0-9a-fA-F]{2}$ ]]  || die "addr must be 0xNN"
+    [[ "$off"  =~ ^[0-9]{1,6}$ ]]        || die "offset must be decimal"
+    [[ "$len"  =~ ^[0-9]{1,5}$ ]]        || die "len must be 1..99999"
+    [[ "$aw"   =~ ^(8|16)$ ]]            || die "address width must be 8 or 16"
+    have i2ctransfer || die "i2ctransfer missing: install i2c-tools"
+    modprobe i2c-dev 2>/dev/null || true
+    local o n end=$((off + len)) bytes
+    for (( o = off; o < end; o += 32 )); do
+        n=$(( end - o < 32 ? end - o : 32 ))
+        if [ "$aw" = 16 ]; then
+            bytes=$(i2ctransfer -y "$bus" "w2@$addr" $(( (o >> 8) & 0xff )) $(( o & 0xff )) "r$n" 2>&1) \
+                || { echo "read failed at offset $o: $bytes" >&2; return 1; }
+        else
+            bytes=$(i2ctransfer -y "$bus" "w1@$addr" $(( o & 0xff )) "r$n" 2>&1) \
+                || { echo "read failed at offset $o: $bytes" >&2; return 1; }
+        fi
+        printf '%06x  %s\n' "$o" "$bytes"
+    done
+}
+
+# -------------------------------------------------------------- topology
+cmd_topology() {
+    [ -n "$MEDIA_DEV" ] || die "MEDIA_DEV is not set in $CONF"
+    have media-ctl || die "media-ctl missing: install v4l-utils"
+    [ -e "$MEDIA_DEV" ] || die "$MEDIA_DEV absent"
+    media-ctl -d "$MEDIA_DEV" -p
+}
+
+# -------------------------------------------------------------------- pm
+# Runtime-PM state is where "the device works, then stops working after a
+# suspend" bugs become visible.
+cmd_pm() {
+    [[ "$PCI_DEV" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]] \
+        || die "PCI_DEV must look like 0000:00:05.0 (got '$PCI_DEV')"
+    local p="/sys/bus/pci/devices/$PCI_DEV/power"
+    [ -d "$p" ] || die "$p absent"
+    echo "=== runtime PM: $PCI_DEV ==="
+    local f
+    for f in runtime_status runtime_enabled runtime_active_time \
+             runtime_suspended_time control autosuspend_delay_ms; do
+        [ -r "$p/$f" ] && printf '%-24s %s\n' "$f" "$(cat "$p/$f")"
+    done
+    echo "=== resume-path errors this boot ==="
+    journalctl -k -b --no-pager 2>/dev/null \
+        | grep -E 'Failed to get runtime PM|secure mode|PM: suspend exit' \
+        | tail -n 20 || true
+}
+
+# ------------------------------------------------------------------ acpi
+# ACPI tables are root-only (0400). On laptops the SSDTs carry the sensor data
+# blobs and the GPIO/clock/regulator wiring that no USB trace will ever show.
+# Copies them out for offline disassembly rather than interpreting them here.
+cmd_acpi() {
+    [ -n "$ACPI_OUT" ] || die "ACPI_OUT is not set in $CONF"
+    [[ "$ACPI_OUT" = /* ]] || die "ACPI_OUT must be an absolute path"
+    mkdir -p "$ACPI_OUT"
+    local t
+    for t in /sys/firmware/acpi/tables/DSDT /sys/firmware/acpi/tables/SSDT*; do
+        [ -f "$t" ] || continue
+        cp -f "$t" "$ACPI_OUT/"
+        # chown only what we just created, rather than -R over a user-writable
+        # tree we do not control.
+        chown "$UID_OUT:$GID_OUT" "$ACPI_OUT/$(basename "$t")"
+        chmod 644 "$ACPI_OUT/$(basename "$t")"
+    done
+    echo "=== copied to $ACPI_OUT ==="
+    ls -l "$ACPI_OUT" | tail -n +2
+    echo
+    echo "decompile with: iasl -d $ACPI_OUT/*"
+    if [ -n "$ACPI_DEVICES" ]; then
+        echo
+        echo "=== matching ACPI devices ==="
+        local pat d
+        for pat in $ACPI_DEVICES; do
+            for d in /sys/bus/acpi/devices/$pat; do
+                [ -e "$d" ] || continue
+                printf '  %-14s status=%-4s path=%s\n' "${d##*/}" \
+                    "$(cat "$d/status" 2>/dev/null)" "$(cat "$d/path" 2>/dev/null)"
+            done
+        done
+    fi
+}
+
+# ---------------------------------------------------------------- config
+# So you can see what this install is actually scoped to without root-reading
+# the file yourself.
+cmd_config() {
+    echo "config: $CONF"
+    sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$CONF"
+}
+
+usage() { cat >&2 <<'EOF'
+hwdbg <command>             (root helper; fixed operations only)
+
+  klog [lines]              kernel ring buffer (default 200 lines)
+  dyndbg on|off             toggle pr_debug for the configured modules
+  reload                    unload + reload the configured module stack
+  debugfs                   dump the configured debugfs trees
+  i2creg 0xNNNN [n] [force] read n bytes from a configured-device register
+  i2cscan                   scan the configured i2c buses
+  eeprom <bus> <0xNN> [off] [len] [8|16]
+                            dump a module EEPROM
+  topology                  media-ctl -p on the configured media device
+  pm                        runtime-PM state of the configured PCI device
+  acpi                      copy ACPI tables out + list matching devices
+  config                    show the active scope
+EOF
+exit 1; }
+
+[ $# -ge 1 ] || usage
+c="$1"; shift
+case "$c" in
+  klog|dyndbg|reload|debugfs|i2creg|i2cscan|eeprom|topology|pm|acpi|config) "cmd_$c" "$@" ;;
+  *) usage ;;
+esac

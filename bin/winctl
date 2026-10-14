@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# winctl - drive a Windows reference VM without touching the physical desktop.
+#
+# RDP renders into a private Xvfb display, so synthetic input goes to that
+# display's own input devices and cannot reach your real keyboard or mouse.
+# We do NOT use portal/PipeWire window capture: GNOME stops producing frames
+# for unmapped windows, so an "off-screen" real window yields black output.
+# A separate X server is genuinely off-screen.
+#
+# Prefer `winctl exec` (SSH) over GUI poking; use the GUI only for things with
+# no scriptable equivalent.
+
+set -euo pipefail
+PROG=winctl
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+load_config
+
+# Resolved once per invocation. The explicit '|| return 1' matters: a die()
+# inside $(...) kills only the subshell, so a swallowed failure here would
+# silently hand every later command an empty hostname.
+HOST=
+host() {
+    [ -n "$HOST" ] && { echo "$HOST"; return 0; }
+    HOST=$(resolve_host) || return 1
+    echo "$HOST"
+}
+
+rdp_bin() { command -v xfreerdp3 2>/dev/null || command -v xfreerdp 2>/dev/null \
+            || die "no xfreerdp (install freerdp)"; }
+
+# ------------------------------------------------------------------- auth
+# Run once per project. Generates the keypair if absent - the public half is
+# what probes/win-bootstrap.ps1 installs in the guest, so no key material is
+# ever shared between users of this repo.
+cmd_auth() {
+    need secret-tool ssh-keygen
+
+    if [ ! -f "$SSH_KEY" ]; then
+        ssh-keygen -t ed25519 -N '' -q -f "$SSH_KEY" \
+                   -C "hw-harness@$(hostname -s)"
+        info "generated $SSH_KEY"
+    fi
+    chmod 600 "$SSH_KEY"
+
+    local su ru rd
+    read -rp 'SSH username (the local Windows profile name): ' su
+    [ -n "$su" ] || die "SSH username is required"
+    echo "RDP identity: for a Microsoft account use the full email address."
+    read -rp 'RDP username: ' ru
+    read -rp "RDP domain [$RDP_DOMAIN_DEFAULT]: " rd; rd="${rd:-$RDP_DOMAIN_DEFAULT}"
+
+    printf '%s' "$su" > "$ETC/ssh.user";   chmod 600 "$ETC/ssh.user"
+    printf '%s' "$ru" > "$ETC/rdp.user";   chmod 600 "$ETC/rdp.user"
+    printf '%s' "$rd" > "$ETC/rdp.domain"; chmod 600 "$ETC/rdp.domain"
+
+    echo -n 'RDP password (stored in the login keyring, not on disk): '
+    secret_set
+    info "stored: ssh=$su rdp=$rd\\$ru"
+
+    if ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+           -o ConnectTimeout=5 "$su@$(host)" 'exit' 2>/dev/null; then
+        info "SSH key auth: OK"
+    else
+        info "SSH key auth: not working yet."
+        info "Build the bootstrap ISO ('harness iso'), attach it to the VM, and"
+        info "run win-bootstrap.ps1 in an ELEVATED PowerShell inside the guest."
+    fi
+}
+
+# -------------------------------------------------------------- session up
+cmd_up() {
+    need Xvfb xdotool secret-tool
+    local rdp; rdp=$(rdp_bin)
+    local u d p; u=$(rdp_user); d=$(rdp_domain); p=$(secret_get)
+    [ -n "$p" ] || die "no stored password; run 'winctl auth'"
+
+    # Background children must NOT inherit our stdout/stderr: otherwise any
+    # caller piping winctl's output blocks forever waiting for EOF on a pipe
+    # the daemons still hold open.
+    if [ -f "$RUN/xvfb.pid" ] && kill -0 "$(cat "$RUN/xvfb.pid")" 2>/dev/null; then
+        info "Xvfb already up on $WINCTL_DISPLAY"
+    else
+        Xvfb "$WINCTL_DISPLAY" -screen 0 "${WINCTL_GEOMETRY}x24" -nolisten tcp \
+            >"$RUN/xvfb.log" 2>&1 </dev/null &
+        echo $! > "$RUN/xvfb.pid"; sleep 1
+        kill -0 "$(cat "$RUN/xvfb.pid")" 2>/dev/null \
+            || die "Xvfb failed; see $RUN/xvfb.log"
+        info "Xvfb up on $WINCTL_DISPLAY (${WINCTL_GEOMETRY})"
+    fi
+
+    # /from-stdin needs a tty (it calls tcsetattr) so it is unusable here.
+    # /p: on argv would expose the password via world-readable /proc/PID/cmdline.
+    # /args-from:file: avoids both; the file is 0600 and shredded immediately.
+    local af="$RUN/args.$$"
+    ( umask 077
+      { printf '%s\n' "/v:$(host)" "/u:$u"
+        [ -n "$d" ] && printf '%s\n' "/d:$d"
+        printf '%s\n' "/p:$p" "/size:$WINCTL_GEOMETRY" "/cert:ignore" \
+                      "+clipboard" "/log-level:ERROR"
+      } > "$af" )
+
+    DISPLAY="$WINCTL_DISPLAY" "$rdp" /args-from:file:"$af" \
+        >"$RUN/rdp.log" 2>&1 </dev/null &
+    echo $! > "$RUN/rdp.pid"
+    sleep 8
+    shred -u "$af" 2>/dev/null || rm -f "$af"
+
+    if ! kill -0 "$(cat "$RUN/rdp.pid")" 2>/dev/null; then
+        echo "--- rdp.log ---" >&2
+        grep -v 'set_termianl_nonblock' "$RUN/rdp.log" | tail -15 >&2
+        die "xfreerdp exited early"
+    fi
+    info "RDP session attached (pid $(cat "$RUN/rdp.pid"))"
+}
+
+cmd_down() {
+    local f
+    for f in rdp xvfb; do
+        [ -f "$RUN/$f.pid" ] && { kill "$(cat "$RUN/$f.pid")" 2>/dev/null || true
+                                  rm -f "$RUN/$f.pid"; }
+    done
+    info "session torn down"
+}
+
+cmd_status() {
+    local f h
+    printf '%-10s %s\n' 'project:' "$PROJECT"
+    printf '%-10s %s\n' 'vm:' "$VM_NAME ($VM_LIBVIRT_URI)"
+    for f in xvfb rdp; do
+        if [ -f "$RUN/$f.pid" ] && kill -0 "$(cat "$RUN/$f.pid")" 2>/dev/null
+        then printf '%-10s running (%s)\n' "$f:" "$(cat "$RUN/$f.pid")"
+        else printf '%-10s down\n' "$f:"; fi
+    done
+
+    if ! h=$(host 2>/dev/null); then
+        printf '%-10s %s\n' 'host:' 'unresolved (VM not running, or no guest agent)'
+        return 0
+    fi
+    printf '%-10s %s\n' 'host:' "$h"
+
+    if [ ! -f "$ETC/ssh.user" ] || [ ! -f "$SSH_KEY" ]; then
+        printf '%-10s %s\n' 'ssh:' "not set up - run 'winctl auth'"
+        return 0
+    fi
+    if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=5 \
+           "$(cat "$ETC/ssh.user")@$h" 'exit' 2>/dev/null
+    then printf '%-10s %s\n' 'ssh:' 'ok'
+    else printf '%-10s %s\n' 'ssh:' 'unreachable (bootstrap not run in the guest?)'; fi
+}
+
+cmd_host() { host; }
+
+# ------------------------------------------------------------------ capture
+cmd_shot() {
+    local out="${1:-$CAPTURES/shot-$(date +%Y%m%d-%H%M%S).png}"
+    if command -v import >/dev/null; then
+        DISPLAY="$WINCTL_DISPLAY" import -window root "$out"
+    elif command -v ffmpeg >/dev/null; then
+        ffmpeg -loglevel error -y -f x11grab -video_size "$WINCTL_GEOMETRY" \
+               -i "$WINCTL_DISPLAY" -frames:v 1 "$out"
+    else die "need ImageMagick or ffmpeg"; fi
+    echo "$out"
+}
+
+# ------------------------------------------- synthetic input (private display)
+cmd_type()  { need xdotool; DISPLAY="$WINCTL_DISPLAY" xdotool type --delay 25 -- "$*"; }
+cmd_key()   { need xdotool; DISPLAY="$WINCTL_DISPLAY" xdotool key -- "$@"; }
+cmd_click() { need xdotool; DISPLAY="$WINCTL_DISPLAY" xdotool mousemove "$1" "$2" click "${3:-1}"; }
+
+# --------------------------------------------------------------- ssh / files
+cmd_exec() { ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                 "$(ssh_user)@$(host)" "$@"; }
+cmd_push() { scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$1" "$(ssh_user)@$(host):$2"
+             info "pushed $1 -> $2"; }
+cmd_pull() { scp -i "$SSH_KEY" -o BatchMode=yes -q -r "$(ssh_user)@$(host):$1" "$2"
+             info "pulled $1 -> $2"; }
+
+# Piping to `powershell -Command -` over SSH silently yields nothing when
+# DefaultShell is PowerShell, so stage the file and use -File.
+cmd_run() {
+    [ -f "$1" ] || die "no such script: $1"
+    local remote="C:/Users/$(ssh_user)/.winctl-$(basename "$1")"
+    scp -i "$SSH_KEY" -o BatchMode=yes -q "$1" "$(ssh_user)@$(host):$remote"
+    ssh -i "$SSH_KEY" -o BatchMode=yes "$(ssh_user)@$(host)" \
+        "powershell -ExecutionPolicy Bypass -File ${remote//\//\\}"
+}
+
+# Run the generic device probe in the guest and bring the results back.
+# $1 is an optional PnP instance-ID filter, e.g. 'USB\VID_07B3*'.
+#
+# The output directory is computed here rather than in the guest: working out
+# a remote path through two layers of quoting (ssh, then PowerShell) is a
+# reliable source of silent breakage.
+cmd_probe() {
+    local filter="${1:-*}"
+    local ts; ts=$(date +%Y%m%d-%H%M%S)
+    local out="C:/Users/$(ssh_user)/probe-$ts"
+    local remote="C:/Users/$(ssh_user)/.winctl-dump-devices.ps1"
+
+    info "probing with filter: $filter"
+    scp -i "$SSH_KEY" -o BatchMode=yes -q "$HARNESS_ROOT/probes/dump-devices.ps1" \
+        "$(ssh_user)@$(host):$remote"
+    ssh -i "$SSH_KEY" -o BatchMode=yes "$(ssh_user)@$(host)" \
+        "powershell -ExecutionPolicy Bypass -File ${remote//\//\\} \
+         -Filter '$filter' -OutDir '${out//\//\\}'"
+    cmd_pull "$out" "$CAPTURES/"
+    info "probe landed in $CAPTURES/probe-$ts"
+}
+
+usage() { cat >&2 <<'EOF'
+winctl <command>                 (reads harness.conf from the project directory)
+
+  auth                 generate the SSH key, store SSH + RDP identities
+  up / down            start / stop the off-screen RDP session
+  status               project, VM, session and SSH health
+  host                 print the resolved guest address
+
+  shot [file]          screenshot the off-screen session
+  type <text>          synthetic typing (private display only)
+  key <keys...>        e.g. Return, ctrl+shift+Escape
+  click <x> <y> [b]    synthetic mouse
+
+  exec <cmd...>        run a command in the guest over SSH   <-- prefer this
+  run <local.ps1>      run a local PowerShell script in the guest
+  probe [filter]       run dump-devices.ps1 and pull the results back
+  push <local> <remote>
+  pull <remote> <local>
+EOF
+exit 1; }
+
+[ $# -ge 1 ] || usage
+c="$1"; shift
+case "$c" in
+  auth|up|down|status|host|shot|type|key|click|exec|run|probe|push|pull) "cmd_$c" "$@" ;;
+  *) usage ;;
+esac

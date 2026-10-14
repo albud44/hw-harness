@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# hostdev - hand the USB device under investigation to the Windows VM, or take
+# it back for Linux.
+#
+# Only one side can own the device at a time, which is the core rhythm of the
+# work: pass it through, record what the vendor driver does, take it back,
+# record what your Linux driver does, diff the two.
+#
+# managed='yes' makes libvirt detach the device from its host driver on attach
+# and reattach it on detach, so no manual unbind is needed.
+
+set -euo pipefail
+PROG=hostdev
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+load_config
+
+[ -n "$USB_VID" ] && [ -n "$USB_PID" ] \
+    || die "USB_VID / USB_PID are not set in $PROJECT/harness.conf"
+need virsh
+
+xml="$RUN/hostdev.xml"
+sed -e "s/@USB_VID@/$USB_VID/" -e "s/@USB_PID@/$USB_PID/" \
+    "$HARNESS_ROOT/templates/hostdev-usb.xml.in" > "$xml"
+
+v() { virsh -c "$VM_LIBVIRT_URI" "$@"; }
+
+case "${1:-}" in
+  to-vm)
+      v attach-device "$VM_NAME" "$xml" --live
+      info "$USB_VID:$USB_PID attached to $VM_NAME"
+      info "the host no longer sees it; usbcap on the host still does"
+      ;;
+  to-host)
+      v detach-device "$VM_NAME" "$xml" --live
+      info "$USB_VID:$USB_PID returned to the host"
+      ;;
+  persist)
+      # --config survives a guest reboot, which you want while driving an
+      # installer that reboots halfway through.
+      v attach-device "$VM_NAME" "$xml" --config
+      info "$USB_VID:$USB_PID will be attached on next boot of $VM_NAME"
+      ;;
+  status)
+      echo "--- host ---"
+      lsusb -d "$USB_VID:$USB_PID" || echo "(not visible to the host)"
+      echo "--- $VM_NAME ---"
+      v dumpxml "$VM_NAME" 2>/dev/null \
+        | grep -A3 "vendor id='0x$USB_VID'" || echo "(not attached)"
+      ;;
+  *)
+      cat >&2 <<EOF
+hostdev <to-vm|to-host|persist|status>     device: $USB_VID:$USB_PID -> $VM_NAME
+
+  to-vm     pass the device through to the guest (live)
+  to-host   return it to Linux (live)
+  persist   attach in the guest's persistent config too
+  status    who currently owns it
+EOF
+      exit 1 ;;
+esac

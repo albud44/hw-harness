@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# usbcap - time-boxed usbmon capture of the device under investigation.
+#
+# Run with sudo: /dev/usbmon* are root-only and dumpcap is 0750 root:wireshark.
+#
+#   sudo -E ./bin/usbcap <label> [seconds]
+#
+# The capture happens on the HOST, so it sees the traffic a Windows guest
+# generates through USB passthrough exactly as it sees Linux traffic. The guest
+# cannot tell it is being watched, and the two sides become directly
+# comparable - that is the whole point of the technique.
+#
+# Captures the WHOLE BUS, not just the target device. Filtering happens at
+# analysis time so that a wrong filter cannot silently lose data we can never
+# re-capture: a scan or a camera stream is a physical event you may not be
+# able to reproduce byte-for-byte.
+
+set -euo pipefail
+PROG=usbcap
+# shellcheck source=../lib/common.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+load_config
+
+[ -n "$USB_VID" ] && [ -n "$USB_PID" ] \
+    || die "USB_VID / USB_PID are not set in $PROJECT/harness.conf"
+
+label="${1:?usage: sudo -E usbcap <label> [seconds]}"
+secs="${2:-60}"
+[[ "$secs" =~ ^[0-9]{1,5}$ ]] || die "seconds must be 1..99999"
+[[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || die "label: letters, digits, dot, dash, underscore"
+
+need lsusb tshark
+
+# Locate the device and its bus, so we capture the right usbmon interface.
+line=$(lsusb -d "$USB_VID:$USB_PID" | head -1) \
+    || die "device $USB_VID:$USB_PID not found on any bus"
+bus=$(sed -E 's/Bus ([0-9]+).*/\1/' <<< "$line")
+dev=$(sed -E 's/.*Device ([0-9]+):.*/\1/' <<< "$line")
+busn=$((10#$bus)); devn=$((10#$dev))
+
+# usbmon is a module on most distributions and is not loaded by default.
+[ -e "/dev/usbmon$busn" ] || modprobe usbmon 2>/dev/null || true
+[ -e "/dev/usbmon$busn" ] || die "/dev/usbmon$busn missing: 'modprobe usbmon' (needs root)"
+
+out="$CAPTURES/usb"
+mkdir -p "$out"
+ts=$(date +%Y%m%d-%H%M%S)
+pcap="$out/${ts}-${label}.pcapng"
+meta="$out/${ts}-${label}.meta"
+
+# The sidecar .meta is what makes a capture still meaningful in six weeks:
+# which side produced it, at what settings, against which bus address.
+{
+    echo "label=$label"
+    echo "captured=$(date -Is)"
+    echo "device=$USB_VID:$USB_PID bus=$busn devnum=$devn"
+    echo "duration=${secs}s"
+    echo "interface=usbmon$busn"
+    echo "project=$(basename "$PROJECT")"
+    [ -n "${USBCAP_NOTE:-}" ] && echo "note=$USBCAP_NOTE"
+} > "$meta"
+
+echo "[usbcap] bus $busn, device $devn -> $(basename "$pcap")"
+echo "[usbcap] capturing for ${secs}s - EXERCISE THE DEVICE NOW"
+
+tshark -i "usbmon$busn" -a "duration:$secs" -w "$pcap" -q 2>&1 |
+    grep -v '^Capturing on' || true
+
+# Hand the results back to the invoking user, not root.
+if [ -n "${SUDO_UID:-}" ]; then
+    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$pcap" "$meta"
+fi
+
+echo "[usbcap] done: $pcap"
+echo "[usbcap] $(tshark -r "$pcap" -Y "usb.idVendor == 0x$USB_VID || usb.device_address == $devn" 2>/dev/null | wc -l) frames match the device"
+echo "[usbcap] total frames: $(tshark -r "$pcap" 2>/dev/null | wc -l)"

@@ -1,0 +1,19 @@
+# Per-project state never belongs in the tool repo.
+#
+# etc/ holds the generated SSH private key and the SSH/RDP identities;
+# .run/ holds pidfiles and daemon logs; captures/ holds raw traces, which are
+# both large and potentially device-serial-identifying.
+etc/
+.run/
+captures/
+
+# A project scaffolded inside a clone ('harness init .') would otherwise drag
+# its state and its generated media in with it.
+/harness.conf
+bootstrap.iso
+*.pcapng
+*.pcap
+
+# ...but the example configurations are documentation and belong in the repo.
+!examples/*/harness.conf
+!examples/*/hwdbg.conf

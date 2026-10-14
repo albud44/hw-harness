@@ -1,0 +1,15 @@
+# Scoped root access for hardware debugging. Install with:
+#
+#   sudo install -m 0440 -o root -g root this-file /etc/sudoers.d/hwdbg
+#
+# Validate before you rely on it, because a broken sudoers file can lock you
+# out of sudo entirely:
+#
+#   sudo visudo -c -f /etc/sudoers.d/hwdbg
+#
+# Substitute @USER@ with your login name. The rule grants NOPASSWD for exactly
+# one absolute path, and hwdbg accepts no free-form command, path or module
+# name - everything it will do is spelled out in its own source and in its
+# root-owned config. See doc/privilege-model.md for why both files must be
+# root-owned for that guarantee to mean anything.
+@USER@ ALL=(root) NOPASSWD: /usr/local/sbin/hwdbg
