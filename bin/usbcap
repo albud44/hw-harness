@@ -63,12 +63,19 @@ meta="$out/${ts}-${label}.meta"
 echo "[usbcap] bus $busn, device $devn -> $(basename "$pcap")"
 echo "[usbcap] capturing for ${secs}s - EXERCISE THE DEVICE NOW"
 
-tshark -i "usbmon$busn" -a "duration:$secs" -w "$pcap" -q 2>&1 |
-    grep -v '^Capturing on' || true
+# -w - and a redirect, rather than -w "$pcap": under sudo, dumpcap was refused
+# the output file in a root-owned directory (Wireshark 4.7.3 on Manjaro,
+# 2026-10-20), most likely because it gives up its file capabilities once
+# the interface is open. The shell opening the file is genuinely root, so
+# this works whatever the cause.
+tshark -i "usbmon$busn" -a "duration:$secs" -w - -q 2> >(grep -v '^Capturing on' >&2) \
+    > "$pcap" || true
 
-# Hand the results back to the invoking user, not root.
+# Hand the results back to the invoking user, not root - the directory too,
+# since the first capture creates it as root and the user could then never
+# delete a capture from it.
 if [ -n "${SUDO_UID:-}" ]; then
-    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$pcap" "$meta"
+    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$out" "$pcap" "$meta"
 fi
 
 echo "[usbcap] done: $pcap"

@@ -61,8 +61,9 @@ load_config() {
     # anything. Captured here, re-applied after the file is sourced.
     local env_vm=${VM_NAME:-}   env_host=${VM_HOST:-}
     local env_disp=${WINCTL_DISPLAY:-} env_geom=${WINCTL_GEOMETRY:-}
-    local env_key=${SSH_KEY:-}
+    local env_key=${SSH_KEY:-}  env_backend=${VM_BACKEND:-}
 
+    VM_BACKEND=libvirt
     VM_NAME=win11
     VM_HOST=
     VM_LIBVIRT_URI=qemu:///system
@@ -83,6 +84,12 @@ load_config() {
     [ -n "$env_disp" ] && WINCTL_DISPLAY=$env_disp
     [ -n "$env_geom" ] && WINCTL_GEOMETRY=$env_geom
     [ -n "$env_key" ]  && SSH_KEY=$env_key
+    [ -n "$env_backend" ] && VM_BACKEND=$env_backend
+
+    case "$VM_BACKEND" in
+      libvirt|virtualbox) ;;
+      *) die "VM_BACKEND=$VM_BACKEND in $PROJECT/harness.conf: expected libvirt or virtualbox" ;;
+    esac
 
     ETC="$PROJECT/etc"
     RUN="$PROJECT/.run"
@@ -95,9 +102,9 @@ load_config() {
 
 # -------------------------------------------------------------- guest host
 # Resolving the guest address rather than hardcoding it: a VM that gets a new
-# DHCP lease must not silently break every tool. qemu-ga is authoritative
-# (it reports what the guest itself sees); the DHCP lease is the fallback for
-# a guest where the agent is not yet installed.
+# DHCP lease must not silently break every tool. The guest's own view is
+# authoritative - qemu-ga under libvirt, the Guest Additions under VirtualBox.
+# libvirt also falls back to the DHCP lease for a guest without the agent.
 #
 # Cached per session in .run/vm.host because 'winctl exec' is called in loops.
 resolve_host() {
@@ -112,20 +119,59 @@ resolve_host() {
         fi
     fi
 
+    local ip=
+    case "$VM_BACKEND" in
+      libvirt)    ip=$(vm_ip_libvirt) ;;
+      virtualbox) ip=$(vm_ip_virtualbox) ;;
+    esac
+
+    if [ -z "$ip" ]; then
+        case "$VM_BACKEND" in
+          libvirt) die "cannot resolve an address for VM '$VM_NAME'.
+  Is it running ('virsh -c $VM_LIBVIRT_URI list')? Is qemu-ga installed in the
+  guest (probes/win-bootstrap.ps1 installs it)? Otherwise pin VM_HOST= in
+  harness.conf." ;;
+          virtualbox) die "cannot resolve an address for VM '$VM_NAME'.
+  Is it running ('VBoxManage list runningvms')? Does it have a host-only
+  adapter, and are the Guest Additions running in the guest? See
+  doc/vm-setup.md. Otherwise pin VM_HOST= in harness.conf." ;;
+        esac
+    fi
+
+    printf '%s' "$ip" > "$cache"
+    echo "$ip"
+}
+
+vm_ip_libvirt() {
     need virsh
     local ip=
     ip=$(virsh -c "$VM_LIBVIRT_URI" domifaddr "$VM_NAME" --source agent 2>/dev/null |
          awk '$3 == "ipv4" { split($4, a, "/"); print a[1]; exit }')
     [ -z "$ip" ] && ip=$(virsh -c "$VM_LIBVIRT_URI" domifaddr "$VM_NAME" --source lease 2>/dev/null |
          awk '$3 == "ipv4" { split($4, a, "/"); print a[1]; exit }')
-
-    [ -n "$ip" ] || die "cannot resolve an address for VM '$VM_NAME'.
-  Is it running ('virsh -c $VM_LIBVIRT_URI list')? Is qemu-ga installed in the
-  guest (probes/win-bootstrap.ps1 installs it)? Otherwise pin VM_HOST= in
-  harness.conf."
-
-    printf '%s' "$ip" > "$cache"
     echo "$ip"
+}
+
+# Only a host-only adapter is reachable from the host: the NAT adapter's
+# 10.0.2.x address is private to VirtualBox. The guest numbers its interfaces
+# (GuestInfo/Net/<i>) in its own order, not by VirtualBox slot, so the
+# host-only adapter is matched by MAC address rather than by index.
+vm_ip_virtualbox() {
+    need VBoxManage
+    local mac i
+    mac=$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+          awk -F= '{ gsub(/"/, "", $2) }
+                   $1 ~ /^macaddress[0-9]+$/ { mac[substr($1, 11)] = $2 }
+                   $1 ~ /^nic[0-9]+$/ && $2 == "hostonly" && !n { n = substr($1, 4) }
+                   END { if (n) print mac[n] }')
+    [ -n "$mac" ] || return 0
+    i=$(VBoxManage guestproperty enumerate "$VM_NAME" \
+            --patterns '/VirtualBox/GuestInfo/Net/*/MAC' 2>/dev/null |
+        awk -v mac="$mac" 'index(toupper($0), toupper(mac)) && match($0, /Net\/[0-9]+\//) {
+                               print substr($0, RSTART + 4, RLENGTH - 5); exit }')
+    [ -n "$i" ] || return 0
+    VBoxManage guestproperty get "$VM_NAME" "/VirtualBox/GuestInfo/Net/$i/V4/IP" 2>/dev/null |
+        awk '$1 == "Value:" { print $2 }'
 }
 
 # --------------------------------------------------------------- identities

@@ -125,7 +125,9 @@ cmd_down() {
 cmd_status() {
     local f h
     printf '%-10s %s\n' 'project:' "$PROJECT"
-    printf '%-10s %s\n' 'vm:' "$VM_NAME ($VM_LIBVIRT_URI)"
+    if [ "$VM_BACKEND" = libvirt ]
+    then printf '%-10s %s\n' 'vm:' "$VM_NAME (libvirt, $VM_LIBVIRT_URI)"
+    else printf '%-10s %s\n' 'vm:' "$VM_NAME ($VM_BACKEND)"; fi
     for f in xvfb rdp; do
         if [ -f "$RUN/$f.pid" ] && kill -0 "$(cat "$RUN/$f.pid")" 2>/dev/null
         then printf '%-10s running (%s)\n' "$f:" "$(cat "$RUN/$f.pid")"
@@ -133,7 +135,7 @@ cmd_status() {
     done
 
     if ! h=$(host 2>/dev/null); then
-        printf '%-10s %s\n' 'host:' 'unresolved (VM not running, or no guest agent)'
+        printf '%-10s %s\n' 'host:' 'unresolved (VM not running, or no guest agent / Guest Additions)'
         return 0
     fi
     printf '%-10s %s\n' 'host:' "$h"

@@ -5,9 +5,6 @@
 # Only one side can own the device at a time, which is the core rhythm of the
 # work: pass it through, record what the vendor driver does, take it back,
 # record what your Linux driver does, diff the two.
-#
-# managed='yes' makes libvirt detach the device from its host driver on attach
-# and reattach it on detach, so no manual unbind is needed.
 
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=../lib/common.sh
@@ -17,40 +14,133 @@ load_config
 if [ -z "$USB_VID" ] || [ -z "$USB_PID" ]; then
     die "USB_VID / USB_PID are not set in $PROJECT/harness.conf"
 fi
-need virsh
 
-xml="$RUN/hostdev.xml"
-sed -e "s/@USB_VID@/$USB_VID/" -e "s/@USB_PID@/$USB_PID/" \
-    "$HARNESS_ROOT/templates/hostdev-usb.xml.in" > "$xml"
+# ------------------------------------------------------------------ libvirt
+# managed='yes' makes libvirt detach the device from its host driver on attach
+# and reattach it on detach, so no manual unbind is needed.
+libvirt_cmd() {
+    need virsh
+    local xml="$RUN/hostdev.xml"
+    sed -e "s/@USB_VID@/$USB_VID/" -e "s/@USB_PID@/$USB_PID/" \
+        "$HARNESS_ROOT/templates/hostdev-usb.xml.in" > "$xml"
+    v() { virsh -c "$VM_LIBVIRT_URI" "$@"; }
 
-v() { virsh -c "$VM_LIBVIRT_URI" "$@"; }
-
-case "${1:-}" in
-  to-vm)
-      v attach-device "$VM_NAME" "$xml" --live
-      info "$USB_VID:$USB_PID attached to $VM_NAME"
-      info "the host no longer sees it; usbcap on the host still does"
-      ;;
-  to-host)
-      v detach-device "$VM_NAME" "$xml" --live
-      info "$USB_VID:$USB_PID returned to the host"
-      ;;
-  persist)
+    case "$1" in
+      to-vm)   v attach-device "$VM_NAME" "$xml" --live ;;
+      to-host) v detach-device "$VM_NAME" "$xml" --live ;;
       # --config survives a guest reboot, which you want while driving an
       # installer that reboots halfway through.
-      v attach-device "$VM_NAME" "$xml" --config
-      info "$USB_VID:$USB_PID will be attached on next boot of $VM_NAME"
-      ;;
+      persist) v attach-device "$VM_NAME" "$xml" --config ;;
+      status)
+          v dumpxml "$VM_NAME" 2>/dev/null \
+            | grep -A3 "vendor id='0x$USB_VID'" || echo "(not attached)" ;;
+    esac
+}
+
+# --------------------------------------------------------------- virtualbox
+# usbattach takes one concrete device, by UUID. A device that renumbers itself
+# mid-operation - firmware upload, mode switch - comes back as a new device
+# with a new UUID, and would land on the host halfway through the session.
+# A VM filter on vendor:product catches every re-enumeration, which is what
+# libvirt's <vendor>/<product> match does. So to-vm installs the filter, and
+# to-host removes it before detaching, or it would grab the device straight
+# back. to-vm may find the device already captured - by an earlier to-vm, or
+# by the filter it has just added - and that is success, not an error.
+FILTER="hw-harness $USB_VID:$USB_PID"
+
+# Prints "<uuid> <state>" for the device; the state is Available, Busy, Held
+# or Captured.
+vbox_device() {
+    VBoxManage list usbhost 2>/dev/null |
+        awk -v vid="0x$USB_VID" -v pid="0x$USB_PID" '
+            $1 == "UUID:"     { u = $2; hit = 0 }
+            $1 == "VendorId:" { vend = tolower($2) }
+            $1 == "ProductId:" && vend == tolower(vid) && tolower($2) == tolower(pid) { hit = 1 }
+            hit && $1 == "Current" && $2 == "State:" { print u, $3; exit }'
+}
+
+# USBFilterName<N> is 1-based; usbfilter takes a 0-based index.
+vbox_filter_index() {
+    VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+        awk -F= -v name="\"$FILTER\"" '
+            $1 ~ /^USBFilterName[0-9]+$/ && $2 == name {
+                print substr($1, 14) - 1; exit }'
+}
+
+vbox_filter_add() {
+    [ -n "$(vbox_filter_index)" ] && return 0
+    # Index 0 puts it ahead of any broader filter already on the VM.
+    VBoxManage usbfilter add 0 --target="$VM_NAME" --name="$FILTER" \
+        --vendorid="$USB_VID" --productid="$USB_PID" --active=yes
+}
+
+vbox_filter_remove() {
+    local i; i=$(vbox_filter_index)
+    [ -n "$i" ] && VBoxManage usbfilter remove "$i" --target="$VM_NAME"
+    return 0
+}
+
+virtualbox_cmd() {
+    need VBoxManage
+    local uuid state err
+    case "$1" in
+      to-vm)
+          vbox_filter_add
+          read -r uuid state <<< "$(vbox_device)"
+          [ -n "$uuid" ] || die "$USB_VID:$USB_PID not found by VirtualBox (plugged in? in group vboxusers?)"
+          [ "$state" = Captured ] && return 0
+          if ! err=$(VBoxManage controlvm "$VM_NAME" usbattach "$uuid" 2>&1); then
+              read -r uuid state <<< "$(vbox_device)"
+              [ "$state" = Captured ] || die "usbattach failed: $err"
+          fi ;;
+      to-host)
+          vbox_filter_remove
+          read -r uuid state <<< "$(vbox_device)"
+          [ -n "$uuid" ] || die "$USB_VID:$USB_PID not found by VirtualBox"
+          [ "$state" = Captured ] || return 0
+          VBoxManage controlvm "$VM_NAME" usbdetach "$uuid" ;;
+      persist)
+          # The filter is part of the VM's saved settings: it applies on the
+          # next boot and to every later plug-in.
+          vbox_filter_add ;;
+      status)
+          if [ -n "$(vbox_filter_index)" ]
+          then echo "filter: '$FILTER' installed"
+          else echo "filter: none"; fi
+          # USBAttach<Field><N>: pair vendor and product by their index N.
+          VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+              awk -F= -v vid="0x$USB_VID" -v pid="0x$USB_PID" '
+                  { gsub(/"/, "", $2) }
+                  match($1, /^USBAttach[A-Za-z]+/) {
+                      i = substr($1, RLENGTH + 1) + 0
+                      f[substr($1, 10, RLENGTH - 9), i] = $2
+                      if (i > n) n = i }
+                  END {
+                      for (i = 1; i <= n; i++)
+                          if (tolower(f["VendorId", i]) == tolower(vid) &&
+                              tolower(f["ProductId", i]) == tolower(pid)) {
+                              print "attached: " f["Product", i] " " f["Address", i]; found = 1 }
+                      if (!found) print "(not attached)" }' ;;
+    esac
+}
+
+case "${1:-}" in
+  to-vm|to-host|persist)
+      "${VM_BACKEND}_cmd" "$1"
+      case "$1" in
+        to-vm)   info "$USB_VID:$USB_PID attached to $VM_NAME"
+                 info "the host no longer sees it; usbcap on the host still does" ;;
+        to-host) info "$USB_VID:$USB_PID returned to the host" ;;
+        persist) info "$USB_VID:$USB_PID will be attached on next boot of $VM_NAME" ;;
+      esac ;;
   status)
       echo "--- host ---"
       lsusb -d "$USB_VID:$USB_PID" || echo "(not visible to the host)"
-      echo "--- $VM_NAME ---"
-      v dumpxml "$VM_NAME" 2>/dev/null \
-        | grep -A3 "vendor id='0x$USB_VID'" || echo "(not attached)"
-      ;;
+      echo "--- $VM_NAME ($VM_BACKEND) ---"
+      "${VM_BACKEND}_cmd" status ;;
   *)
       cat >&2 <<EOF
-hostdev <to-vm|to-host|persist|status>     device: $USB_VID:$USB_PID -> $VM_NAME
+hostdev <to-vm|to-host|persist|status>     device: $USB_VID:$USB_PID -> $VM_NAME ($VM_BACKEND)
 
   to-vm     pass the device through to the guest (live)
   to-host   return it to Linux (live)

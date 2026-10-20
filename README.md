@@ -33,13 +33,27 @@ deliberately does not touch vendor `.sys` code.
 
 ## Requirements
 
-Developed and tested on Fedora. You need libvirt/KVM and a **Windows 11 Pro**
-guest (Home has no RDP server):
+Developed and tested on Fedora with libvirt/KVM. VirtualBox works too
+(`VM_BACKEND=virtualbox` in `harness.conf`). Either way you need a
+**Windows 11 Pro** guest (Home has no RDP server).
+
+Fedora, libvirt/KVM:
 
     sudo dnf install libvirt virt-manager freerdp xorg-x11-server-Xvfb \
                      xdotool libsecret wireshark-cli usbutils ImageMagick \
                      acpica-tools xorriso
     sudo usermod -aG libvirt,wireshark $USER    # then log out and back in
+
+Manjaro / Arch, VirtualBox (pick the `linuxNNN-virtualbox-host-modules`
+matching your kernel; `mhwd-kernel -li` names it):
+
+    sudo pacman -S --needed virtualbox linux618-virtualbox-host-modules \
+                   virtualbox-guest-iso freerdp xorg-server-xvfb xdotool \
+                   libsecret wireshark-cli usbutils imagemagick acpica libisoburn
+    sudo usermod -aG vboxusers,wireshark $USER  # then log out and back in
+
+The VirtualBox VM needs a host-only adapter and no catch-all USB filter; see
+[doc/vm-setup.md](doc/vm-setup.md#virtualbox).
 
 `harness doctor` checks all of it and tells you what is missing and why it
 matters.
@@ -55,7 +69,7 @@ One clone of this repo serves every investigation. The clone is the *tool*; a
     harness doctor
     harness init ~/projects/myscanner
     cd ~/projects/myscanner
-    $EDITOR harness.conf            # VM_NAME, USB_VID/USB_PID from lsusb
+    $EDITOR harness.conf            # VM_BACKEND, VM_NAME, USB_VID/USB_PID from lsusb
 
     winctl auth                     # generates an SSH key, stores the RDP password
     harness iso                     # bootstrap.iso, carrying the PUBLIC key only

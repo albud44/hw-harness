@@ -5,14 +5,20 @@
 # inside the tree. It is sourced as shell, so it can compute values if needed.
 
 # ------------------------------------------------------------ Windows guest
-# The libvirt domain holding the vendor driver. See doc/vm-setup.md.
+# Which hypervisor holds the VM: libvirt (KVM) or virtualbox.
+VM_BACKEND=libvirt
+
+# The libvirt domain, or the VirtualBox VM name, holding the vendor driver.
+# See doc/vm-setup.md.
 VM_NAME=win11
+# libvirt only.
 VM_LIBVIRT_URI=qemu:///system
 
-# Leave VM_HOST empty to resolve the address through the QEMU guest agent on
-# every call (with the DHCP lease as fallback). Pin it only if the guest has a
-# static address or no agent, because a pinned address that goes stale fails
-# in confusing ways.
+# Leave VM_HOST empty to resolve the address on every call: through the QEMU
+# guest agent (DHCP lease as fallback) under libvirt, through the Guest
+# Additions on the host-only adapter under VirtualBox. Pin it only if the
+# guest has a static address or no agent, because a pinned address that goes
+# stale fails in confusing ways.
 VM_HOST=
 
 # ------------------------------------------------------- device under study

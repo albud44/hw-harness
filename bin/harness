@@ -67,8 +67,17 @@ check_tool() {
 
 cmd_doctor() {
     FAILED=0
-    echo "host tools (required):"
-    check_tool virsh        "libvirt client, for VM and passthrough control"
+    # The project's harness.conf names the backend, which decides what the
+    # rest of the checks look for, so it is read first.
+    local in_project=
+    if PROJECT=$(find_project 2>/dev/null); then load_config; in_project=1; fi
+    local backend=${VM_BACKEND:-libvirt}
+
+    echo "host tools (required, backend: $backend):"
+    case "$backend" in
+      libvirt)    check_tool virsh      "libvirt client, for VM and passthrough control" ;;
+      virtualbox) check_tool VBoxManage "VirtualBox CLI, for VM and passthrough control" ;;
+    esac
     check_tool ssh          "scripted work in the guest"
     check_tool Xvfb         "the private off-screen display"
     check_tool xdotool      "synthetic input into that display"
@@ -89,17 +98,25 @@ cmd_doctor() {
     if id -nG | tr ' ' '\n' | grep -qx wireshark
     then ok "member of group 'wireshark' (dumpcap usable)"
     else note "not in group 'wireshark': usbcap needs sudo (that is fine)"; fi
-    if virsh -c "${VM_LIBVIRT_URI:-qemu:///system}" list >/dev/null 2>&1
-    then ok "libvirt system connection reachable"
-    else bad "cannot reach ${VM_LIBVIRT_URI:-qemu:///system} - add yourself to 'libvirt'"; fi
+    case "$backend" in
+      libvirt)
+        if virsh -c "${VM_LIBVIRT_URI:-qemu:///system}" list >/dev/null 2>&1
+        then ok "libvirt system connection reachable"
+        else bad "cannot reach ${VM_LIBVIRT_URI:-qemu:///system} - add yourself to 'libvirt'"; fi ;;
+      virtualbox)
+        # Without it VirtualBox lists host USB devices but cannot capture them.
+        if id -nG | tr ' ' '\n' | grep -qx vboxusers
+        then ok "member of group 'vboxusers' (USB passthrough)"
+        else bad "not in group 'vboxusers' - USB passthrough will fail"; fi ;;
+    esac
     if modinfo usbmon >/dev/null 2>&1 || [ -e /dev/usbmon0 ]
     then ok "usbmon available"
     else note "usbmon not found: 'modprobe usbmon' needs root, or it is built in"; fi
 
     echo "project:"
-    if PROJECT=$(find_project 2>/dev/null); then
+    if [ -n "$in_project" ]; then
         ok "project: $PROJECT"
-        load_config
+        [ "$backend" = virtualbox ] && doctor_vbox_vm
         if [ -n "$USB_VID$USB_PID" ]
         then ok "device: $USB_VID:$USB_PID"
         else note "USB_VID/USB_PID unset (fine for a non-USB device)"; fi
@@ -116,6 +133,46 @@ cmd_doctor() {
     fi
     echo
     info "all required checks passed"
+}
+
+# The VM-side settings the VirtualBox backend relies on. libvirt has no
+# equivalent check: its defaults (a NAT network the host can reach,
+# passthrough only on request) are already what the harness needs.
+doctor_vbox_vm() {
+    local info
+    if ! info=$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null); then
+        bad "VirtualBox has no VM named '$VM_NAME' (VBoxManage list vms)"; return
+    fi
+    ok "VM: $VM_NAME"
+
+    if grep -qE '^nic[0-9]+="hostonly"$' <<< "$info"
+    then ok "host-only adapter present"
+    elif [ -n "$VM_HOST" ]
+    then note "no host-only adapter, VM_HOST pinned to $VM_HOST"
+    else bad "no host-only adapter: the host cannot reach the guest (doc/vm-setup.md)"; fi
+
+    # An active filter that matches nothing in particular captures every USB
+    # device plugged in while the VM runs - the device under study included,
+    # behind hostdev's back.
+    local catchall name
+    catchall=$(awk -F= '
+        { gsub(/"/, "", $2) }
+        match($1, /^USBFilter[A-Za-z]+/) {
+            f[substr($1, 10, RLENGTH - 9), substr($1, RLENGTH + 1) + 0] = $2 }
+        END {
+            for (k in f) {
+                split(k, p, SUBSEP)
+                if (p[1] != "Active" || f[k] != "on") continue
+                i = p[2]
+                if (f["VendorId", i] f["ProductId", i] f["Revision", i] \
+                    f["Manufacturer", i] f["Product", i] f["SerialNumber", i] == "")
+                    print f["Name", i] }
+        }' <<< "$info")
+    if [ -n "$catchall" ]; then
+        while IFS= read -r name; do
+            bad "USB filter '$name' is active and matches every device - deactivate it"
+        done <<< "$catchall"
+    else ok "no catch-all USB filter"; fi
 }
 
 # --------------------------------------------------------------------- iso
@@ -159,11 +216,40 @@ EOF
     local iso="$PROJECT/bootstrap.iso"
     "$mk" -quiet -V HW_HARNESS -J -r -o "$iso" "$stage"
     info "built $iso"
-    cat <<EOF
-
+    echo
+    case "$VM_BACKEND" in
+      libvirt) cat <<EOF
 Attach it to the VM:
   virsh -c $VM_LIBVIRT_URI attach-disk $VM_NAME "$iso" sdc --type cdrom --mode readonly --live
 Or in virt-manager: Add Hardware -> Storage -> CDROM -> $iso
+EOF
+      ;;
+      virtualbox) iso_hint_vbox "$iso" ;;
+    esac
+}
+
+# Swapping the medium of an existing DVD drive works on a running VM; adding
+# a drive does not. Only DVD slots carry a <ctl>-IsEjected-<port>-<dev> key,
+# which is how the drive is found.
+iso_hint_vbox() {
+    local iso=$1 slot ctl port dev
+    slot=$(VBoxManage showvminfo "$VM_NAME" --machinereadable 2>/dev/null |
+           awk -F= '{ gsub(/"/, "", $1) }
+                    match($1, /-IsEjected-[0-9]+-[0-9]+$/) {
+                        split(substr($1, RSTART + 11), pd, "-")
+                        print substr($1, 1, RSTART - 1) "\t" pd[1] "\t" pd[2]; exit }')
+    if [ -z "$slot" ]; then
+        cat <<EOF
+$VM_NAME has no DVD drive. Add one with the VM powered off, in the VM
+settings: Storage -> Add optical drive -> $iso
+EOF
+        return
+    fi
+    IFS=$'\t' read -r ctl port dev <<< "$slot"
+    cat <<EOF
+Insert it in the VM's DVD drive (this replaces the disc currently in it):
+  VBoxManage storageattach $VM_NAME --storagectl "$ctl" --port $port --device $dev --type dvddrive --medium "$iso"
+Or in the VM window: Devices -> Optical Drives -> Choose a disk file -> $iso
 EOF
 }
 
