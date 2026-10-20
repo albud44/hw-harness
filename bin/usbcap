@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # usbcap - time-boxed usbmon capture of the device under investigation.
 #
-# Run with sudo: /dev/usbmon* are root-only and dumpcap is 0750 root:wireshark.
+# /dev/usbmon* are root-only on most distributions, so run it with sudo:
 #
 #   sudo -E ./bin/usbcap <label> [seconds]
+#
+# or, once a udev rule gives the 'wireshark' group read access to them (see
+# doc/privilege-model.md), as a plain member of that group.
 #
 # The capture happens on the HOST, so it sees the traffic a Windows guest
 # generates through USB passthrough exactly as it sees Linux traffic. The guest
@@ -70,6 +73,14 @@ echo "[usbcap] capturing for ${secs}s - EXERCISE THE DEVICE NOW"
 # this works whatever the cause.
 tshark -i "usbmon$busn" -a "duration:$secs" -w - -q 2> >(grep -v '^Capturing on' >&2) \
     > "$pcap" || true
+
+# tshark's failure is deliberately not fatal above, so that its own message
+# reaches the user; an empty file is how it shows here. Leaving it behind would
+# make a capture that never happened look like a quiet one.
+if [ ! -s "$pcap" ]; then
+    rm -f "$pcap" "$meta"
+    die "nothing was captured (see tshark's message above)"
+fi
 
 # Hand the results back to the invoking user, not root - the directory too,
 # since the first capture creates it as root and the user could then never

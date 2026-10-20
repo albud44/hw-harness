@@ -112,6 +112,11 @@ cmd_doctor() {
     if modinfo usbmon >/dev/null 2>&1 || [ -e /dev/usbmon0 ]
     then ok "usbmon available"
     else note "usbmon not found: 'modprobe usbmon' needs root, or it is built in"; fi
+    if [ -e /dev/usbmon0 ]; then
+        if [ -r /dev/usbmon0 ]
+        then ok "/dev/usbmon* readable: usbcap runs without sudo"
+        else note "/dev/usbmon* root-only: usbcap needs sudo (or a udev rule, doc/privilege-model.md)"; fi
+    fi
 
     echo "project:"
     if [ -n "$in_project" ]; then

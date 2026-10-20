@@ -25,8 +25,19 @@ yourself to `wireshark` makes captures possible without sudo:
     sudo usermod -aG wireshark $USER     # then log out and back in
 
 `/dev/usbmon*` is still root-only on most distributions, so `usbcap` is
-documented with `sudo` anyway. If your distribution grants the `wireshark`
-group access to `/dev/usbmon*`, you can drop the sudo.
+documented with `sudo` anyway. Group membership alone does not get past
+that: `dumpcap`'s file capabilities are network ones, and they do not open
+a root-only device node. A udev rule does, and makes the module load at
+boot while you are at it:
+
+    echo 'SUBSYSTEM=="usbmon", GROUP="wireshark", MODE="0640"' |
+        sudo tee /etc/udev/rules.d/50-accessible-usbmon.rules
+    echo usbmon | sudo tee /etc/modules-load.d/usbmon.conf
+    sudo udevadm control --reload-rules
+    sudo modprobe usbmon && sudo udevadm trigger --subsystem-match=usbmon
+
+After that, `usbcap` runs as a plain member of `wireshark`, and
+`harness doctor` reports `/dev/usbmon*` as readable.
 
 ## What genuinely needs root: hwdbg
 
